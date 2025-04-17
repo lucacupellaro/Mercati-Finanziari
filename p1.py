@@ -4,19 +4,20 @@ from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 import numpy as np
+from sklearn.naive_bayes import GaussianNB
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 
 class MyIbApp(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
         self.historicalDataList = []
         self.contractDetailsList = []
-        self.got_contract = False
 
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
         print(f"Errore (reqId {reqId}, codice {errorCode}): {errorString}")
 
     def nextValidId(self, orderId):
-        # Primo passo: cerchiamo i contratti future GC
         contract = Contract()
         contract.symbol = "GC"
         contract.secType = "FUT"
@@ -26,21 +27,12 @@ class MyIbApp(EWrapper, EClient):
         self.reqContractDetails(reqId=1, contract=contract)
 
     def contractDetails(self, reqId, contractDetails):
-        """
-        Riceviamo i dettagli dei contratti disponibili.
-        """
         self.contractDetailsList.append(contractDetails)
 
     def contractDetailsEnd(self, reqId):
-        """
-        Quando abbiamo finito di ricevere i contratti.
-        """
         if self.contractDetailsList:
-            # Prendiamo il primo contratto disponibile (il più vicino come scadenza)
             selected_contract = self.contractDetailsList[0].contract
             print(f"Selezionato contratto: {selected_contract.symbol} {selected_contract.lastTradeDateOrContractMonth}")
-
-            # Ora possiamo richiedere i dati storici
             self.reqHistoricalData(
                 reqId=2,
                 contract=selected_contract,
@@ -63,94 +55,51 @@ class MyIbApp(EWrapper, EClient):
             'Apertura': bar.open,
             'Massimo': bar.high,
             'Minimo': bar.low,
-            'Prezzo': bar.close,  # Cambiato da 'Chiusura' a 'Prezzo'
+            'Prezzo': bar.close,
             'Volume': bar.volume
         })
 
     def historicalDataEnd(self, reqId, start, end):
         print("Ricezione dati storici conclusa.")
         df = pd.DataFrame(self.historicalDataList)
-        print(df.head())
 
-        # Salva i dati grezzi
         df.to_csv("dati_storici_gc.csv", index=False)
         print("Dati salvati in 'dati_storici_gc.csv'.")
 
-        # Calcola Volume Profile
         vp_df = MyIbApp.calcola_volume_profile_giornaliero(df)
-
-        # Salva Volume Profile
         vp_df.to_csv("VolumeProfile.csv", index=False)
         print("Volume Profile salvato in 'VolumeProfile.csv'.")
 
+        # Ora lanciamo la preparazione dataset + modello
+        MyIbApp.prepara_e_allena_modello(df, vp_df)
+
         self.disconnect()
 
+    @staticmethod
     def calcola_volume_profile_giornaliero(df, soglia_value_area=0.70):
-        """
-        Calcola, per ogni giorno nel DataFrame, POC, Value Area Low (VAL) e Value Area High (VAH).
-
-        Argomenti:
-        ----------
-        df : Pandas DataFrame
-            Deve contenere almeno le colonne 'Data', 'Prezzo', 'Volume'.
-            La colonna 'Data' può avere date o datetime. Se c'è ora e minuto,
-            verranno ignorati (si raggruppa per data).
-        soglia_value_area : float
-            Percentuale del volume (in forma decimale) che definisce la Value Area;
-            tipicamente 0.70 (70%).
-
-        Ritorno:
-        --------
-        ris : Pandas DataFrame
-            Un DataFrame con le colonne:
-            - 'Data'
-            - 'POC'
-            - 'VAL'
-            - 'VAH'
-        """
-
-        # Per sicurezza, convertiamo la colonna "Data" in formato datetime (se non lo è già),
-        # e prendiamo solo la parte di data per raggruppare.
         df['Data'] = pd.to_datetime(df['Data']).dt.date
-
         risultati = []
-
-        # Raggruppa per la singola data
         gruppi_per_data = df.groupby('Data')
 
         for giorno, gruppo in gruppi_per_data:
-            # Raggruppiamo i volumi per prezzo (sommando i volumi sullo stesso prezzo)
             volume_by_price = gruppo.groupby('Prezzo')['Volume'].sum().reset_index()
-
-            # Ordiniamo per prezzo
             volume_by_price = volume_by_price.sort_values('Prezzo').reset_index(drop=True)
 
-            # Calcoliamo il volume totale del giorno
             volume_totale = volume_by_price['Volume'].sum()
             if volume_totale == 0:
-                # Se volume_totale è 0 (caso estremo), continuiamo comunque
-                risultati.append({
-                    'Data': giorno,
-                    'POC': np.nan,
-                    'VAL': np.nan,
-                    'VAH': np.nan
-                })
+                risultati.append({'Data': giorno, 'POC': np.nan, 'VAL': np.nan, 'VAH': np.nan})
                 continue
 
-            # Troviamo il POC (prezzo con volume massimo)
             idx_poc = volume_by_price['Volume'].idxmax()
             poc_price = volume_by_price.loc[idx_poc, 'Prezzo']
 
             volume_by_price_sorted = volume_by_price.sort_values('Volume', ascending=False).reset_index(drop=True)
-
-            # Spostiamo la riga corrispondente al POC in cima
             poc_row = volume_by_price_sorted[volume_by_price_sorted['Prezzo'] == poc_price]
             volume_by_price_sorted = pd.concat([
                 poc_row,
                 volume_by_price_sorted[volume_by_price_sorted['Prezzo'] != poc_price]
             ], ignore_index=True)
 
-            # Ora sommiamo i volumi finché non raggiungiamo la soglia
             cumulato = 0
             prezzi_selezionati = []
             for i, row in volume_by_price_sorted.iterrows():
@@ -159,19 +108,64 @@ class MyIbApp(EWrapper, EClient):
                 if cumulato >= soglia_value_area * volume_totale:
                     break
 
-            # Troviamo min e max dei prezzi selezionati => VAL, VAH
             val = min(prezzi_selezionati)
             vah = max(prezzi_selezionati)
 
-            risultati.append({
-                'Data': giorno,
-                'POC': poc_price,
-                'VAL': val,
-                'VAH': vah
-            })
+            risultati.append({'Data': giorno, 'POC': poc_price, 'VAL': val, 'VAH': vah})
 
-        ris = pd.DataFrame(risultati)
-        return ris
+        return pd.DataFrame(risultati)
+
+    @staticmethod
+    def prepara_e_allena_modello(df_orario, df_vp):
+        print("Preparo dataset per modello...")
+
+        df_orario['Data'] = pd.to_datetime(df_orario['Data'])
+        df_orario['Data_giorno'] = df_orario['Data'].dt.date
+
+        aperture_giornaliere = df_orario.groupby('Data_giorno').first().reset_index()
+        aperture_giornaliere = aperture_giornaliere[['Data_giorno', 'Apertura', 'Prezzo']]
+
+        chiusure_giornaliere = df_orario.groupby('Data_giorno').last().reset_index()
+        chiusure_giornaliere = chiusure_giornaliere[['Data_giorno', 'Prezzo']].rename(columns={'Prezzo': 'Chiusura'})
+
+        df_volume_profile = df_vp.copy()
+        df_volume_profile['Data_giorno'] = pd.to_datetime(df_volume_profile['Data']).dt.date
+
+        df_merged = pd.merge(aperture_giornaliere, df_volume_profile, on='Data_giorno', how='inner')
+        df_merged = pd.merge(df_merged, chiusure_giornaliere, on='Data_giorno', how='inner')
+
+        df_merged['POC_ieri'] = df_merged['POC'].shift(1)
+        df_merged['VAL_ieri'] = df_merged['VAL'].shift(1)
+        df_merged['VAH_ieri'] = df_merged['VAH'].shift(1)
+
+        df_merged['apertura_sopra_VAL_ieri'] = (df_merged['Apertura'] > df_merged['VAL_ieri']).astype(int)
+        df_merged['apertura_sopra_VAH_ieri'] = (df_merged['Apertura'] > df_merged['VAH_ieri']).astype(int)
+
+        df_merged['Chiusura_domani'] = df_merged['Chiusura'].shift(-1)
+        df_merged['ritorno'] = (df_merged['Chiusura_domani'] - df_merged['Chiusura']) / df_merged['Chiusura']
+        df_merged['Target'] = (df_merged['ritorno'] > 0).astype(int)
+
+        features = ['apertura_sopra_VAL_ieri', 'apertura_sopra_VAH_ieri']
+        X = df_merged[features].dropna()
+        y = df_merged['Target'].dropna()
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+        modello = GaussianNB()
+        modello.fit(X_train, y_train)
+
+        predizioni = modello.predict(X_test)
+
+        print("Report prestazioni modello:")
+        print(classification_report(y_test, predizioni))
+
+        ultimo_valore = X.iloc[-1:].values
+        pred_oggi = modello.predict(ultimo_valore)
+
+        if pred_oggi[0] == 1:
+            print("Segnale operativo di oggi: BUY ✅")
+        else:
+            print("Segnale operativo di oggi: SELL ❌")
 
 
 def main():
@@ -179,7 +173,6 @@ def main():
     app.connect("127.0.0.1", 7497, clientId=0)
     time.sleep(1)
     app.run()
-
 
 if __name__ == "__main__":
     main()
